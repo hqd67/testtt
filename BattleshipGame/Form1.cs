@@ -1,10 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
-using System.Windows.Forms;
-using System.Collections.Generic;
-using System.Threading.Tasks;
 using System.Text.Json;
+using System.Threading.Tasks;
+using System.Windows.Forms;
 
 namespace BattleshipGame
 {
@@ -25,7 +25,7 @@ namespace BattleshipGame
         private Dictionary<int, int> shipLimits = new Dictionary<int, int> { { 4, 1 }, { 3, 2 }, { 2, 3 }, { 1, 4 } };
         private Dictionary<int, int> shipsPlaced = new Dictionary<int, int> { { 4, 0 }, { 3, 0 }, { 2, 0 }, { 1, 0 } };
 
-        // UI controls references (so they are accessible)
+        // UI controls
         private TextBox ipBox;
         private TextBox portBox;
         private Button hostBtn;
@@ -43,7 +43,6 @@ namespace BattleshipGame
             network.MessageReceived += OnNetworkMessage;
         }
 
-        // Build runtime UI (keeps Designer optional)
         private void BuildUiRuntime()
         {
             this.Text = "Battleship - Network";
@@ -96,7 +95,7 @@ namespace BattleshipGame
             Controls.Add(botBtn);
 
             autoBtn = new Button { Location = new Point(570, 325), Size = new Size(120, 30), Text = "Авто-расстановка" };
-            autoBtn.Click += (s, e) => { ResetShipsPlaced(); AutoPlaceShips(); };
+            autoBtn.Click += async (s, e) => { ResetShipsPlaced(); await AutoPlaceShipsNetwork(); };
             Controls.Add(autoBtn);
 
             sizeLabel = new Label { Location = new Point(10, 370), Text = "Размер: 4", AutoSize = true };
@@ -112,12 +111,10 @@ namespace BattleshipGame
             statusLabel = new Label { Location = new Point(10, 400), Text = "Статус: Готов", AutoSize = true };
             Controls.Add(statusLabel);
 
-            // initialize fields
             RefreshField(clear: true);
         }
 
-        // ---------------- Network helpers ----------------
-
+        // ---------------- Network ----------------
         private async Task StartHost()
         {
             if (!int.TryParse(portBox.Text, out int port))
@@ -158,10 +155,8 @@ namespace BattleshipGame
             }
         }
 
-        // Обработка входящих сетевых сообщений (строка JSON)
         private void OnNetworkMessage(string json)
         {
-            // парсим тип сообщения
             try
             {
                 var doc = JsonDocument.Parse(json);
@@ -182,19 +177,51 @@ namespace BattleshipGame
                     string result = root.GetProperty("result").GetString();
                     HandleShotResult(x, y, result);
                 }
+                else if (type == "Placement")
+                {
+                    var ships = root.GetProperty("ships").EnumerateArray();
+                    ApplyEnemyPlacement(ships);
+                }
                 else if (type == "Reset")
                 {
-                    // соперник попросил сбросить игру
-                    Invoke(() => { ResetGame(); });
+                    Invoke(() => ResetGame());
                 }
             }
-            catch
-            {
-                // ignore malformed
-            }
+            catch { }
         }
 
-        // Обработка входящего выстрела от противника
+        private void ApplyEnemyPlacement(IEnumerable<JsonElement> ships)
+        {
+            for (int x = 0; x < 10; x++)
+                for (int y = 0; y < 10; y++)
+                {
+                    game.RemotePlayer.Grid[x, y].State = CellState.Empty;
+                    game.RemotePlayer.Grid[x, y].Ship = null;
+                }
+            game.RemotePlayer.Ships.Clear();
+
+            foreach (var s in ships)
+            {
+                int x = s.GetProperty("x").GetInt32();
+                int y = s.GetProperty("y").GetInt32();
+                int size = s.GetProperty("size").GetInt32();
+                string ori = s.GetProperty("orientation").GetString();
+
+                Ship ship = new Ship { Orientation = ori == "H" ? Orientation.Horizontal : Orientation.Vertical };
+                for (int i = 0; i < size; i++)
+                {
+                    int cx = x + (ship.Orientation == Orientation.Horizontal ? i : 0);
+                    int cy = y + (ship.Orientation == Orientation.Vertical ? i : 0);
+                    var cell = game.RemotePlayer.Grid[cx, cy];
+                    cell.State = CellState.Ship;
+                    cell.Ship = ship;
+                    ship.Cells.Add(cell);
+                }
+                game.RemotePlayer.Ships.Add(ship);
+            }
+            RefreshField();
+        }
+
         private void HandleIncomingShot(int x, int y)
         {
             Invoke(async () =>
@@ -212,44 +239,32 @@ namespace BattleshipGame
                     cell.State = CellState.Miss;
                     result = "Miss";
                 }
-                else
-                {
-                    // уже открыта — считаем промахом
-                    result = cell.State == CellState.Ship ? "Hit" : "Miss";
-                }
+                else result = "Miss";
 
                 RefreshField();
-
-                // отправляем результат обратно сопернику
                 await network.SendAsync(new { type = "Result", x = x, y = y, result = result });
 
-                // проверяем победу
                 if (game.CheckWinner())
                 {
                     statusLabel.Text = "Статус: Вы проиграли";
                     MessageBox.Show("Все ваши корабли уничтожены — вы проиграли.");
                     ResetGame();
                 }
-                else
-                {
-                    // если промах — ход переходит к нам (т.е. противник сделал ход, теперь наш)
-                    // но синхронизация ходов нужно контролировать в UI
-                }
             });
         }
 
-        // Обработка результата своего выстрела (пришло от соперника)
         private void HandleShotResult(int x, int y, string result)
         {
             Invoke(() =>
             {
-                if (result == "Miss")
-                    game.RemotePlayer.Grid[x, y].State = CellState.Miss;
-                else if (result == "Hit")
-                    game.RemotePlayer.Grid[x, y].State = CellState.Hit;
-                else if (result == "Sunk")
-                    game.RemotePlayer.Grid[x, y].State = CellState.Sunk;
-
+                var cell = game.RemotePlayer.Grid[x, y];
+                cell.State = result switch
+                {
+                    "Hit" => CellState.Hit,
+                    "Sunk" => CellState.Sunk,
+                    "Miss" => CellState.Miss,
+                    _ => cell.State
+                };
                 RefreshField();
 
                 if (game.CheckWinner())
@@ -261,15 +276,15 @@ namespace BattleshipGame
             });
         }
 
-        // ---------------- Bot and placement ----------------
+        // ---------------- Bot / Placement ----------------
 
         private void StartBotGame()
         {
             playWithBot = true;
             ResetShipsPlaced();
             InitBotShots();
-            AutoPlaceShips();     // размещаем нашего игрока случайно
-            PlaceBotShips();      // размещаем бот-поле
+            AutoPlaceShips();
+            PlaceBotShips();
             statusLabel.Text = "Статус: Игра против бота. Ваш ход.";
         }
 
@@ -287,13 +302,11 @@ namespace BattleshipGame
                     botAvailableShots.Add(new Point(x, y));
         }
 
-        // --- Player manual placement ---
         private void PlayerGrid_MouseDown(object sender, MouseEventArgs e)
         {
             Button btn = sender as Button;
             Point pos = (Point)btn.Tag;
-            int x = pos.X;
-            int y = pos.Y;
+            int x = pos.X, y = pos.Y;
 
             if (e.Button == MouseButtons.Right)
             {
@@ -323,7 +336,7 @@ namespace BattleshipGame
                 int cy = y + (orientation == Orientation.Vertical ? i : 0);
                 if (cx >= 10 || cy >= 10) return false;
                 if (game.LocalPlayer.Grid[cx, cy].State != CellState.Empty) return false;
-                // Also prevent touching other ships (optional)
+
                 for (int dx = -1; dx <= 1; dx++)
                     for (int dy = -1; dy <= 1; dy++)
                     {
@@ -351,10 +364,27 @@ namespace BattleshipGame
             game.LocalPlayer.Ships.Add(ship);
         }
 
-        // --- Auto placement ---
+        private async Task AutoPlaceShipsNetwork()
+        {
+            AutoPlaceShips();
+            if (network.IsConnected)
+            {
+                await network.SendAsync(new
+                {
+                    type = "Placement",
+                    ships = game.LocalPlayer.Ships.Select(s => new
+                    {
+                        x = s.Cells.First().X,
+                        y = s.Cells.First().Y,
+                        size = s.Cells.Count,
+                        orientation = s.Orientation == Orientation.Horizontal ? "H" : "V"
+                    })
+                });
+            }
+        }
+
         private void AutoPlaceShips()
         {
-            // очистка игрока
             for (int x = 0; x < 10; x++)
                 for (int y = 0; y < 10; y++)
                 {
@@ -385,10 +415,8 @@ namespace BattleshipGame
             RefreshField();
         }
 
-        // --- Bot placement ---
         private void PlaceBotShips()
         {
-            // очистка удалённого
             for (int x = 0; x < 10; x++)
                 for (int y = 0; y < 10; y++)
                 {
@@ -442,7 +470,6 @@ namespace BattleshipGame
             game.RemotePlayer.Ships.Add(ship);
         }
 
-        // --- Player shot (either bot or network) ---
         private async void EnemyGrid_Click(object sender, EventArgs e)
         {
             if (game.State == GameState.GameOver) return;
@@ -451,7 +478,6 @@ namespace BattleshipGame
             Point pos = (Point)btn.Tag;
             int x = pos.X, y = pos.Y;
 
-            // ignore clicking on already revealed cells
             var targetCell = game.RemotePlayer.Grid[x, y];
             if (targetCell.State == CellState.Miss || targetCell.State == CellState.Hit || targetCell.State == CellState.Sunk) return;
 
@@ -461,20 +487,16 @@ namespace BattleshipGame
                 return;
             }
 
-            // network mode: send Shot message
             if (!network.IsConnected)
             {
                 MessageBox.Show("Нет сетевого соединения.");
                 return;
             }
 
-            // mark waiting visually optional
             statusLabel.Text = "Статус: Ожидание результата...";
             await network.SendAsync(new { type = "Shot", x = x, y = y });
-            // actual result will arrive via network MessageReceived -> Result
         }
 
-        // --- Player vs Bot shot logic ---
         private async Task PlayerShotBot(int x, int y)
         {
             var cell = game.RemotePlayer.Grid[x, y];
@@ -483,10 +505,7 @@ namespace BattleshipGame
                 cell.State = CellState.Hit;
                 if (cell.Ship.IsSunk) cell.Ship.MarkSunk();
             }
-            else if (cell.State == CellState.Empty)
-            {
-                cell.State = CellState.Miss;
-            }
+            else if (cell.State == CellState.Empty) cell.State = CellState.Miss;
 
             RefreshField();
 
@@ -525,32 +544,23 @@ namespace BattleshipGame
                 return;
             }
 
-            // give turn back
             statusLabel.Text = "Статус: Ваш ход";
         }
 
-        // --- Network incoming handling is in OnNetworkMessage above ---
-
-        // Reset game: clear both fields, hide enemy ships, reset counters
         private void ResetGame()
         {
-            playWithBot = false; // reset mode
-            // clear player
+            playWithBot = false;
+
             for (int x = 0; x < 10; x++)
                 for (int y = 0; y < 10; y++)
                 {
                     game.LocalPlayer.Grid[x, y].State = CellState.Empty;
                     game.LocalPlayer.Grid[x, y].Ship = null;
-                }
-            game.LocalPlayer.Ships.Clear();
-
-            // clear remote
-            for (int x = 0; x < 10; x++)
-                for (int y = 0; y < 10; y++)
-                {
                     game.RemotePlayer.Grid[x, y].State = CellState.Empty;
                     game.RemotePlayer.Grid[x, y].Ship = null;
                 }
+
+            game.LocalPlayer.Ships.Clear();
             game.RemotePlayer.Ships.Clear();
 
             ResetShipsPlaced();
@@ -558,13 +568,11 @@ namespace BattleshipGame
             statusLabel.Text = "Статус: Готов";
         }
 
-        // Refresh UI field; if clear==true — show empty fields
         private void RefreshField(bool clear = false)
         {
             for (int x = 0; x < 10; x++)
                 for (int y = 0; y < 10; y++)
                 {
-                    // player
                     var pc = game.LocalPlayer.Grid[x, y];
                     playerButtons[x, y].BackColor = clear ? Color.LightBlue : pc.State switch
                     {
@@ -576,12 +584,11 @@ namespace BattleshipGame
                         _ => Color.LightBlue
                     };
 
-                    // enemy: hide ships unless revealed (Hit/Sunk)
                     var ec = game.RemotePlayer.Grid[x, y];
                     enemyButtons[x, y].BackColor = clear ? Color.LightBlue : ec.State switch
                     {
                         CellState.Empty => Color.LightBlue,
-                        CellState.Ship => Color.LightBlue, // keep hidden
+                        CellState.Ship => Color.LightBlue,
                         CellState.Miss => Color.White,
                         CellState.Hit => Color.Red,
                         CellState.Sunk => Color.DarkRed,
